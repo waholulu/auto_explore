@@ -1,0 +1,272 @@
+import openai
+import pandas as pd
+import json
+from IPython.display import Javascript, display, Markdown
+from IPython import get_ipython
+import io
+import sys
+
+################################################################################
+# 1. Setup: Configure your OpenAI API Key
+################################################################################
+
+openai.api_key = "key"
+
+################################################################################
+# 2. LLM function using the OpenAI ChatCompletion API
+################################################################################
+
+from openai import OpenAI
+client = OpenAI(api_key=openai.api_key)
+
+def call_llm(prompt):
+    """
+    Calls the OpenAI API (e.g., gpt-4) with the given prompt 
+    and returns the text response. Adjust model, temperature, etc. as needed.
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are an AI assistant that provides helpful, "
+                        "accurate Python code for data exploration tasks."
+                    )
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,  # low temperature for deterministic outputs
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("LLM call failed:", e)
+        return ""
+
+################################################################################
+# 3. Functions to create new code cells, run code, and add outputs as comments
+################################################################################
+
+def clean_code(code):
+    """
+    Remove Markdown code fences (like ```python and ```)
+    so they don't cause syntax errors.
+    """
+    code = code.replace("```python", "")
+    code = code.replace("```", "")
+    return code
+
+def remove_duplicate_imports(code):
+    """
+    Remove duplicate 'import' lines from the generated code
+    to avoid clutter in each new cell.
+    """
+    final_lines = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import "):
+            # Skip any import lines
+            continue
+        final_lines.append(line)
+    return "\n".join(final_lines)
+
+def add_output_as_comments(code, output_str):
+    """
+    Convert the captured output into # comments and append to the code.
+    """
+    if not output_str.strip():
+        return code  # No output, just return original code
+    
+    commented = []
+    for line in output_str.strip().split("\n"):
+        commented.append("# " + line)
+    commented_output = "\n".join(commented)
+    
+    # Insert a blank line before adding comments
+    final_code = code.strip() + "\n\n" + commented_output
+    return final_code
+
+def create_code_cell_visually(code):
+    """
+    Creates a new code cell below the current cell in the Notebook UI,
+    inserts 'code' into it, and auto-runs it.
+    """
+    escaped_code = code.replace("`", "\\`")  # Escape backticks
+    display(Javascript(f"""
+        var code = `{escaped_code}`;
+        var cell = Jupyter.notebook.insert_cell_below('code');
+        cell.set_text(code);
+        // Optionally auto-run the new cell
+        Jupyter.notebook.select(cell);
+        Jupyter.notebook.execute_cell_and_select_below();
+    """))
+
+def run_code_in_backend(code):
+    """
+    Runs 'code' in the CURRENT Python kernel, *synchronously*, 
+    and captures stdout so we can feed it back to the LLM or embed in comments.
+    Returns the printed output as a string.
+    """
+    ipy = get_ipython()
+    backup_stdout = sys.stdout
+    captured_stdout = io.StringIO()
+    sys.stdout = captured_stdout
+
+    try:
+        ipy.run_cell(code, store_history=False)
+    except Exception as e:
+        print(f"[ERROR] Exception while running code:\n{e}")
+    finally:
+        sys.stdout = backup_stdout
+
+    return captured_stdout.getvalue()
+
+def create_and_run_cell(code):
+    """
+    1) Remove extra imports from the generated code.
+    2) Run the code in the backend and capture output.
+    3) Append the output as # comments to the code.
+    4) Create a new cell visually with the final code.
+    5) Return the raw output string (if needed).
+    """
+    code_no_dupes = remove_duplicate_imports(code)
+    output_str = run_code_in_backend(code_no_dupes)
+    #final_code_with_comments = add_output_as_comments(code_no_dupes, output_str)
+    final_code_with_comments = code_no_dupes
+    create_code_cell_visually(final_code_with_comments)
+    return output_str
+
+################################################################################
+# 4. Main automation function
+################################################################################
+
+def auto_explore_dataframe(df, user_goal, llm_function):
+    """
+    Automates data exploration in multiple steps:
+        1. Prompt the LLM for a plan (no code), in strict JSON format.
+        2. Parse the plan for step instructions.
+        3. For each step, ask the LLM to generate Python code, 
+           then create a visible cell AND run the code in the backend.
+        4. Optionally parse outputs, then ask if more steps are needed.
+        5. Create a final Markdown cell with a summary conclusion.
+
+    The updated prompts make it clear the LLM should not recreate the DataFrame.
+    """
+    # A) Prompt the LLM for a step-by-step plan in JSON (no code)
+    plan_prompt = f""" 
+You have a pandas DataFrame named 'df' in the environment with columns: {df.columns.tolist()}.
+Below are a few sample rows for reference: {df.head(2).to_dict()}.
+The user wants to accomplish the following goal:
+{user_goal}
+
+Important:
+- The DataFrame 'df' is already loaded and available. 
+  Do NOT recreate or redefine 'df' in your plan or code.
+- Return only the JSON object, nothing else.
+- Do not wrap your JSON in triple backticks or any Markdown formatting.
+- Do not include any additional text before or after the JSON.
+- The JSON must have the structure:
+  {{
+    "steps": [
+      "Step 1 description",
+      "Step 2 description",
+      ...
+    ]
+  }}
+- No other keys besides "steps".
+- No extra commentary.
+"""
+    plan_json_str = llm_function(plan_prompt)
+    print("[LLM] Proposed Plan (JSON):")
+    print(plan_json_str)
+
+    # B) Parse the plan into steps
+    try:
+        plan_data = json.loads(plan_json_str)
+        steps = plan_data.get("steps", [])
+    except json.JSONDecodeError:
+        print("Could not decode JSON from the LLM response. Using empty steps.")
+        steps = []
+
+    # C) Execute each step in a new cell
+    all_outputs = []
+    for idx, step in enumerate(steps, start=1):
+        step_title = f"Step {idx}"
+
+        # Build the prompt that tells the LLM to use the existing 'df'
+        code_prompt = f"""
+You have a pandas DataFrame named 'df' in memory with columns {df.columns.tolist()}.
+Below is a small sample of 'df': {df.head(2).to_dict()}.
+
+Your task is:
+"{step}"
+
+Generate Python code to accomplish this step in a Jupyter Notebook cell, 
+using only textual outputs (e.g., print statements, df.info(), df.describe()). 
+Crucially, do NOT recreate or redefine the DataFrame.
+Use the existing variable 'df' directly.
+Do not provide any text beyond the code.
+"""
+        generated_code = llm_function(code_prompt)
+        generated_code = clean_code(generated_code)
+
+        output_str = create_and_run_cell(generated_code)
+        all_outputs.append((step, output_str))
+
+        #print(f"[INFO] Output of {step_title}:\n{output_str}")
+
+    # D) Ask if more steps are needed to achieve the user goal
+    followup_prompt = f"""
+We have executed the plan steps:
+{json.dumps(steps, indent=2)}
+
+We have a DataFrame named 'df' already loaded. We did NOT recreate 'df'.
+
+Do we need more steps to achieve the goal: "{user_goal}"?
+If more steps are needed, respond with new steps in the same JSON format:
+{{
+  "steps": [
+    "More step 1",
+    "More step 2"
+  ]
+}}
+If not, say "No more steps needed."
+"""
+    followup_response = llm_function(followup_prompt)
+    print("[LLM] Follow-up Response:")
+    print(followup_response)
+
+    # E) Potentially parse new steps if the LLM says so (omitted for brevity).
+    #    For now, assume we finalize.
+
+    # F) Create a final Markdown cell with overall conclusions
+    summary_prompt = f"""
+Below is the series of outputs from each step:
+{all_outputs}
+
+Provide a concise summary of the findings, in plain text (no JSON).
+"""
+    summary_text = llm_function(summary_prompt).strip()
+
+    # Insert a final Markdown cell with the summary
+    display(Markdown(f"## Final Conclusion & Findings\n\n{summary_text}"))
+
+################################################################################
+# 5. Example usage
+################################################################################
+
+if __name__ == "__main__":
+    # Create some sample DataFrame
+    data = {
+        "Name": ["Alice", "Bob", "Charlie"],
+        "Age": [25, 30, 35],
+        "City": ["New York", "Los Angeles", "Chicago"]
+    }
+    df_example = pd.DataFrame(data)
+
+    # User goal
+    goal_example = "Explore the dataset columns, types, and basic statistics, without any plots."
+
+    # Call the function with the real LLM
+    auto_explore_dataframe(df_example, goal_example, call_llm)
