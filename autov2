@@ -1,0 +1,310 @@
+import openai
+import pandas as pd
+import json
+from IPython.display import Javascript, display, Markdown
+from IPython import get_ipython
+import io
+import sys
+import re
+
+################################################################################
+# 1. Setup: Configure your OpenAI API Key
+################################################################################
+
+openai.api_key = "key"
+from openai import OpenAI
+client = OpenAI(api_key=openai.api_key)
+
+################################################################################
+# 2. LLM function using the OpenAI ChatCompletion API
+################################################################################
+
+def call_llm(prompt):
+    """
+    Calls the OpenAI API (e.g., gpt-4) with the given prompt 
+    and returns the text response. Adjust model, temperature, etc. as needed.
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are an AI assistant that provides helpful, "
+                        "accurate Python code for data exploration tasks. "
+                        "Return only valid JSON if requested."
+                    )
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,  # low temperature for deterministic outputs
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("LLM call failed:", e)
+        return ""
+
+################################################################################
+# 3. Utility functions
+################################################################################
+
+def extract_json_substring(response_text):
+    """
+    A naive approach to finding the first '{' and the last '}' 
+    and extracting everything in between. This avoids using recursive 
+    regex patterns that Python's 're' does not support by default.
+    """
+    start_idx = response_text.find("{")
+    end_idx = response_text.rfind("}")
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        return None
+    # Return the substring from first '{' to last '}'
+    return response_text[start_idx : end_idx + 1]
+
+def clean_code(code):
+    """
+    Remove Markdown code fences (like ```python and ```)
+    so they don't cause syntax errors.
+    """
+    code = code.replace("```python", "")
+    code = code.replace("```", "")
+    return code
+
+def remove_duplicate_imports(code):
+    """
+    Remove duplicate 'import' lines from the generated code
+    to avoid clutter in each new cell.
+    """
+    final_lines = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import "):
+            continue
+        final_lines.append(line)
+    return "\n".join(final_lines)
+
+def create_code_cell_visually(code):
+    """
+    Creates a new code cell below the current cell in the Notebook UI,
+    inserts 'code' into it, and auto-runs it.
+    """
+    escaped_code = code.replace("`", "\\`")  # Escape backticks
+    display(Javascript(f"""
+        var code = `{escaped_code}`;
+        var cell = Jupyter.notebook.insert_cell_below('code');
+        cell.set_text(code);
+        // Optionally auto-run the new cell
+        Jupyter.notebook.select(cell);
+        Jupyter.notebook.execute_cell_and_select_below();
+    """))
+
+def run_code_in_backend(code):
+    """
+    Runs 'code' in the CURRENT Python kernel, *synchronously*, 
+    and captures stdout so we can feed it back to the LLM or embed in comments.
+    Returns the printed output as a string.
+    """
+    ipy = get_ipython()
+    backup_stdout = sys.stdout
+    captured_stdout = io.StringIO()
+    sys.stdout = captured_stdout
+
+    try:
+        ipy.run_cell(code, store_history=False)
+    except Exception as e:
+        print(f"[ERROR] Exception while running code:\n{e}")
+    finally:
+        sys.stdout = backup_stdout
+
+    return captured_stdout.getvalue()
+
+def create_and_run_cell(code):
+    """
+    1) Remove extra imports from the generated code.
+    2) Run the code in the backend and capture output.
+    3) Create a new cell visually with the final code.
+    4) Return the raw output string (if needed).
+    """
+    code_no_dupes = remove_duplicate_imports(code)
+    output_str = run_code_in_backend(code_no_dupes)
+    create_code_cell_visually(code_no_dupes)
+    return output_str
+
+################################################################################
+# 4. Main automation function for multiple DataFrames
+################################################################################
+
+def auto_explore_dataframes(dataframes, user_goal, llm_function):
+    """
+    Automates data exploration with multiple DataFrames in the environment.
+    
+    Arguments:
+      dataframes (dict): 
+        A dictionary where keys are DataFrame variable names (strings) 
+        and values are the actual pandas DataFrame objects.
+      user_goal (str): 
+        A string describing what the user wants to accomplish.
+      llm_function (callable): 
+        A function that takes a prompt (str) and returns the LLM response (str).
+
+    The steps are:
+      1. Prompt the LLM for a plan in strict JSON format (no code).
+      2. Parse the plan for step instructions.
+      3. For each step, ask the LLM to generate Python code, 
+         then create a visible cell AND run the code in the backend.
+      4. Ask if more steps are needed.
+      5. Create a final Markdown cell with a summary conclusion.
+    """
+    # Build a combined string summarizing all dataframes
+    df_summaries = []
+    for name, df in dataframes.items():
+        summary_str = (
+            f"- **{name}**: columns={list(df.columns)};\n"
+            f"  Sample:\n  {df.head(2).to_dict()}\n"
+        )
+        df_summaries.append(summary_str)
+
+    combined_df_info = "\n".join(df_summaries)
+
+    # A) Prompt the LLM for a step-by-step plan in JSON (no code)
+    plan_prompt = f"""
+We have multiple DataFrames available in memory. Below is a quick summary:
+{combined_df_info}
+
+The user wants to accomplish the following goal:
+{user_goal}
+
+Important:
+- The DataFrames are already loaded and available. 
+  Do NOT recreate or redefine them in your plan or code.
+- Return only the JSON object, nothing else.
+- Do not wrap your JSON in triple backticks or any Markdown formatting.
+- The JSON must have the structure:
+{{
+  "steps": [
+    "Step 1 description",
+    "Step 2 description",
+    ...
+  ]
+}}
+- No other keys besides "steps".
+- No extra commentary.
+"""
+    print(plan_prompt)
+    plan_json_str = llm_function(plan_prompt)
+    print("[LLM] Proposed Plan (JSON):")
+    print(plan_json_str)
+
+    # --- SIMPLER STEP: Extract the JSON substring if there's extra text ---
+    extracted_plan = extract_json_substring(plan_json_str)
+    if extracted_plan is None:
+        print("Could not find JSON substring. Using empty steps.")
+        steps = []
+    else:
+        try:
+            plan_data = json.loads(extracted_plan)
+            steps = plan_data.get("steps", [])
+        except json.JSONDecodeError:
+            print("Could not decode JSON substring. Using empty steps.")
+            steps = []
+
+    # C) Execute each step in a new cell
+    all_outputs = []
+    for idx, step in enumerate(steps, start=1):
+        step_title = f"Step {idx}"
+
+        code_prompt = f"""
+We have multiple DataFrames in memory. Here is their summary:
+{combined_df_info}
+
+Your step is:
+"{step}"
+
+Generate Python code to accomplish this step in a Jupyter Notebook cell, 
+using only textual outputs (e.g., print statements, .info(), .describe(), etc.).
+Crucially:
+- Do NOT recreate or redefine any DataFrame (just use them directly).
+- Refer to them by their given names: {list(dataframes.keys())}.
+
+Do not provide any text beyond the code.
+"""
+        generated_code = llm_function(code_prompt)
+        generated_code = clean_code(generated_code)
+
+        output_str = create_and_run_cell(generated_code)
+        all_outputs.append((step, output_str))
+
+    # D) Ask if more steps are needed to achieve the user goal
+    followup_prompt = f"""
+We have executed the plan steps:
+{json.dumps(steps, indent=2)}
+
+We have multiple DataFrames in memory: {list(dataframes.keys())}.
+We did NOT recreate them.
+
+Do we need more steps to achieve the goal: "{user_goal}"?
+If more steps are needed, respond with new steps in the same JSON format:
+{{
+  "steps": [
+    "More step 1",
+    "More step 2"
+  ]
+}}
+If not, say "No more steps needed."
+"""
+    followup_response = llm_function(followup_prompt)
+    print("[LLM] Follow-up Response:")
+    print(followup_response)
+
+    # --- Extract from follow-up if needed ---
+    extracted_followup = extract_json_substring(followup_response)
+    if extracted_followup is not None:
+        try:
+            followup_data = json.loads(extracted_followup)
+            new_steps = followup_data.get("steps", [])
+            # For brevity, we won't automatically execute them here,
+            # but you could do so using the same loop logic.
+        except json.JSONDecodeError:
+            pass
+
+    # E) Create a final Markdown cell with overall conclusions
+    summary_prompt = f"""
+Below is the series of outputs from each step:
+{all_outputs}
+
+Provide a concise summary of the findings, in plain text (no JSON).
+"""
+    summary_text = llm_function(summary_prompt).strip()
+    display(Markdown(f"## Final Conclusion & Findings\n\n{summary_text}"))
+
+################################################################################
+# 5. Example usage
+################################################################################
+
+if __name__ == "__main__":
+    # Example DataFrame 1: customers
+    df_customers = pd.DataFrame({
+        "CustomerID": [1, 2, 3],
+        "Name": ["Alice", "Bob", "Charlie"],
+        "Age": [25, 30, 35],
+        "City": ["New York", "Los Angeles", "Chicago"]
+    })
+
+    # Example DataFrame 2: orders
+    df_orders = pd.DataFrame({
+        "CustomerID": [1, 2, 3],
+        "OrderID": [101, 102, 103],
+        "Product": ["Widget A", "Widget B", "Widget C"],
+        "Price": [19.99, 29.99, 9.99],
+        "Quantity": [10, 5, 20]
+    })
+
+    dataframes_dict = {
+        "df_customers": df_customers,
+        "df_orders": df_orders
+    }
+
+    goal_example = "Explore the customers and their orders to understand basic stats."
+
+    auto_explore_dataframes(dataframes_dict, goal_example, call_llm)
