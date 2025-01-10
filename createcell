@@ -1,0 +1,13 @@
+from IPython.core.interactiveshell import InteractiveShell
+
+def create_new_code_cell(code):
+    """
+    Schedules a new cell to appear after the current one in
+    Jupyter (classic or lab), containing `code`.
+    The user must manually run that cell once created.
+    """
+    shell = InteractiveShell.instance()
+    shell.set_next_input(code, replace=False)
+
+# Example usage:
+create_new_code_cell("print('Hello from the newly inserted cell!')")
