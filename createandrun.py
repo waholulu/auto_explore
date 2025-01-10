@@ -21,22 +21,30 @@ def run_code_in_backend(code):
 
 def create_code_cell_visually(code):
     """
-    Creates a new Jupyter code cell with 'code' text, and auto-runs it.
+    Creates a new Jupyter code cell with 'code' text and auto-runs it
+    IF in a classic Jupyter Notebook environment.
+    Otherwise, logs a message to the browser console.
     """
     escaped_code = code.replace("`", "\\`")
-    display(Javascript(f"""
+    js_script = f"""
+    if (typeof Jupyter !== 'undefined' && Jupyter.notebook) {{
+        // Classic Jupyter Notebook: we can insert and run a new cell
         var code = `{escaped_code}`;
         var cell = Jupyter.notebook.insert_cell_below('code');
         cell.set_text(code);
-        // Optionally auto-run the new cell
         Jupyter.notebook.select(cell);
         Jupyter.notebook.execute_cell_and_select_below();
-    """))
+    }} else {{
+        // Fallback for JupyterLab / Colab / other environments
+        console.log("Jupyter environment not found. Skipping cell creation.");
+    }}
+    """
+    display(Javascript(js_script))
 
 def create_and_run_cell(code):
     """
-    Runs code in the backend, then inserts a new visible cell with the same code.
-    Returns the captured output from the backend execution.
+    Runs code in the backend, then attempts to insert a new visible cell 
+    with the same code. Returns the captured output from the backend execution.
     """
     output = run_code_in_backend(code)
     create_code_cell_visually(code)
@@ -44,5 +52,6 @@ def create_and_run_cell(code):
 
 # Test usage
 if __name__ == "__main__":
-    result = create_and_run_cell("print('Hello from the test code cell!')")
+    test_code = "print('Hello from the test code cell!')"
+    result = create_and_run_cell(test_code)
     print("Backend output captured:", result)
